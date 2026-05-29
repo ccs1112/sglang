@@ -257,8 +257,8 @@ class BreakableCudaGraphRunner:
         Captured kernels run only on the token-major layer stack and are
         bs-invariant.
         """
-        from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.forward_batch_info import (
+            CaptureKind,
             ForwardBatch,
             ForwardMode,
         )
@@ -281,25 +281,25 @@ class BreakableCudaGraphRunner:
             req_pool_indices = torch.arange(bs, dtype=torch.int64)
             orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
 
-        return ForwardBatch(
+        return ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.BREAKABLE_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
-            batch_size=bs,
             input_ids=buffers.input_ids[:num_tokens],
-            input_embeds=(
-                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
-            ),
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            next_token_logits_buffer=None,
-            orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             seq_lens_sum=num_tokens,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            encoder_lens=None,
-            return_logprob=False,
+            positions=buffers.positions[:num_tokens],
+            orig_seq_lens=orig_seq_lens,
+            input_embeds=(
+                buffers.input_embeds[:num_tokens] if self.is_multimodal else None
+            ),
+            mrope_positions=(
+                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
+            ),
             extend_num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -307,20 +307,8 @@ class BreakableCudaGraphRunner:
             extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
             extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
             extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=buffers.positions[:num_tokens],
-            global_num_tokens_gpu=None,
-            global_num_tokens_for_logprob_gpu=None,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=None,
-            mrope_positions=(
-                buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
-            ),
-            spec_algorithm=None,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=None,
-            global_forward_mode=ForwardMode.EXTEND,
-            lora_ids=None,
         )
 
     def _warmup(self):

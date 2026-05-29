@@ -41,7 +41,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -54,6 +53,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CaptureKind,
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
@@ -379,23 +379,24 @@ class PiecewiseCudaGraphRunner:
             else None
         )
         with torch.device(self.device):
-            forward_batch = ForwardBatch(
+            forward_batch = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_WARMUP_COMPILE,
+                bs=1,
+                num_tokens=num_tokens,
                 forward_mode=ForwardMode.EXTEND,
-                batch_size=1,
                 input_ids=input_ids,
-                input_embeds=input_embeds,
                 req_pool_indices=torch.arange(1, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
-                next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=num_tokens,
+                positions=positions,
+                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 mamba_track_indices=mamba_track_indices,
                 mamba_track_mask=mamba_track_mask,
                 mamba_track_seqlens=mamba_track_seqlens,
-                encoder_lens=None,
-                return_logprob=False,
+                input_embeds=input_embeds,
+                mrope_positions=mrope_positions,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([0], device=self.device),
@@ -403,19 +404,6 @@ class PiecewiseCudaGraphRunner:
                 extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
-                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
-                mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
-                num_token_non_padded_cpu=num_tokens,
-                global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
@@ -546,23 +534,24 @@ class PiecewiseCudaGraphRunner:
             lora_ids = None
 
         with torch.device(self.device):
-            forward_batch = ForwardBatch(
+            forward_batch = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_GRAPH,
+                bs=bs,
+                num_tokens=num_tokens,
                 forward_mode=ForwardMode.EXTEND,
-                batch_size=bs,
                 input_ids=input_ids,
-                input_embeds=input_embeds,
                 req_pool_indices=torch.arange(bs, device=self.device),
                 seq_lens=torch.tensor([num_tokens], device=self.device),
-                next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=num_tokens,
+                positions=positions,
+                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 mamba_track_indices=mamba_track_indices,
                 mamba_track_mask=mamba_track_mask,
                 mamba_track_seqlens=mamba_track_seqlens,
-                encoder_lens=None,
-                return_logprob=False,
+                input_embeds=input_embeds,
+                mrope_positions=mrope_positions,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
                 extend_prefix_lens=torch.tensor([0], device=self.device),
@@ -570,19 +559,6 @@ class PiecewiseCudaGraphRunner:
                 extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
-                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
-                mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
-                num_token_non_padded_cpu=num_tokens,
-                global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
         # Setup hooks below read get_attn_backend() and must run inside the

@@ -46,7 +46,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -60,6 +59,7 @@ from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CaptureKind,
     ForwardBatch,
     ForwardMode,
     NgramEmbeddingInfo,
@@ -1101,33 +1101,35 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
-        forward_batch = ForwardBatch(
+        forward_batch = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.FULL_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
             forward_mode=self.capture_forward_mode,
-            batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
-            next_token_logits_buffer=next_token_logits_buffer,
-            orig_seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
+            positions=positions,
+            orig_seq_lens=seq_lens,
+            next_token_logits_buffer=next_token_logits_buffer,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
-            mamba_track_seqlens=None,  # Prefill only
+            # mamba_track_seqlens stays None — full-graph capture is the
+            # decode/target-verify path; mamba seqlen tracking is prefill-only.
+            mamba_track_seqlens=None,
             encoder_lens=encoder_lens,
-            return_logprob=False,
-            positions=positions,
+            mrope_positions=mrope_positions,
+            spec_info=spec_info,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            capture_hidden_mode=self.capture_hidden_mode,
+            global_forward_mode=self.capture_forward_mode,
+            global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=global_dp_buffer_len,
-            mrope_positions=mrope_positions,
-            spec_algorithm=self.model_runner.spec_algorithm,
-            spec_info=spec_info,
-            capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
