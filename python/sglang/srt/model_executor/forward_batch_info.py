@@ -212,6 +212,44 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
+class CaptureKind(IntEnum):
+    """What kind of capture-time ForwardBatch is being prepared.
+
+    The four kinds differ in: forward_mode default, whether extend_* fields
+    are populated (always for PCG / breakable warmup; per-mode for
+    `_dummy_run`; never for the full-graph capture decode path), and whether
+    DP gather buffers are wired in.
+
+    Used by `ForwardBatch.init_for_capture` to dispatch defaults; the call
+    sites still pass the buffers / spec_info / lora_ids / dp tensors they
+    already had in hand, so each kind stays explicit at the call site.
+    """
+
+    # `ModelRunner._dummy_run` (warmup + DP measure path). Extend fields
+    # are populated only when `is_generation` is False.
+    DUMMY_RUN = auto()
+
+    # `CudaGraphRunner.capture_one_batch_size` — full graph capture. No
+    # extend_* fields; mamba_track_seqlens always None (Prefill only); DP
+    # gather buffers depend on `require_mlp_tp_gather` / `require_attn_tp_gather`.
+    FULL_GRAPH = auto()
+
+    # `PiecewiseCudaGraphRunner.capture_one_batch_size` — PCG capture. bs=1,
+    # extend_* fields populated, mamba_track_* sliced from buffers when
+    # registered, no DP gather buffers (PCG runs intra-rank).
+    PIECEWISE_GRAPH = auto()
+
+    # `PiecewiseCudaGraphRunner.warmup_compile` — sibling to PIECEWISE_GRAPH;
+    # field layout identical, called once per token bucket before capture.
+    PIECEWISE_WARMUP_COMPILE = auto()
+
+    # `BreakableCudaGraphRunner._build_capture_forward_batch` — bs=1
+    # placeholder for breakable graph capture; multi-req metadata is supplied
+    # at replay time via `replay_prepare`. Uses fresh tensors (not buffer
+    # slices) because mamba state tracking is disabled by construction.
+    BREAKABLE_GRAPH = auto()
+
+
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
@@ -750,6 +788,152 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 pin_memory=is_pin_memory_available(batch.device),
             ).to(batch.device, non_blocking=True)
+
+    @classmethod
+    def init_for_capture(
+        cls,
+        *,
+        capture_kind: CaptureKind,
+        bs: int,
+        num_tokens: int,
+        forward_mode: ForwardMode,
+        input_ids: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        seq_lens_sum: int,
+        positions: torch.Tensor,
+        # Optional core tensors / mirrors
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        orig_seq_lens: Optional[torch.Tensor] = None,
+        next_token_logits_buffer: Optional[torch.Tensor] = None,
+        # Mamba state tracking (registered conditionally per feature flag)
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_track_mask: Optional[torch.Tensor] = None,
+        mamba_track_seqlens: Optional[torch.Tensor] = None,
+        # Encoder-decoder
+        encoder_lens: Optional[torch.Tensor] = None,
+        # Multimodal
+        input_embeds: Optional[torch.Tensor] = None,
+        mrope_positions: Optional[torch.Tensor] = None,
+        # Extend metadata — required for PCG / WARMUP / BREAKABLE; optional
+        # for DUMMY_RUN (depends on is_generation); never set for FULL_GRAPH.
+        extend_num_tokens: Optional[int] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_prefix_lens: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
+        extend_logprob_start_lens_cpu: Optional[List[int]] = None,
+        # Spec
+        spec_info: Optional["SpecInput"] = None,
+        spec_algorithm: Optional["SpeculativeAlgorithm"] = None,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        # DP
+        global_forward_mode: Optional[ForwardMode] = None,
+        dp_padding_mode: Optional[DpPaddingMode] = None,
+        global_dp_buffer_len: Optional[int] = None,
+        global_num_tokens_gpu: Optional[torch.Tensor] = None,
+        global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None,
+        # Padding
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        num_token_non_padded_cpu: Optional[int] = None,
+        # LoRA
+        lora_ids: Optional[List[Optional[str]]] = None,
+        # Pooler
+        return_pooled_hidden_states: bool = False,
+    ) -> "ForwardBatch":
+        """Build a capture-time ForwardBatch view.
+
+        Replaces the five hand-coded `ForwardBatch(...)` constructors at the
+        graph-capture entry points:
+
+            1. `ModelRunner._dummy_run`                          (DUMMY_RUN)
+            2. `CudaGraphRunner.capture_one_batch_size`          (FULL_GRAPH)
+            3. `PiecewiseCudaGraphRunner.capture_one_batch_size` (PIECEWISE_GRAPH)
+            4. `PiecewiseCudaGraphRunner.warmup_compile`         (PIECEWISE_WARMUP_COMPILE)
+            5. `BreakableCudaGraphRunner._build_capture_forward_batch`
+                                                                 (BREAKABLE_GRAPH)
+
+        Each capture site historically hand-listed 30-60 kwargs against the
+        same union of FB fields; the field layout was ~70% identical with
+        per-site drift hazards (`mamba_track_seqlens=None` always vs sliced,
+        extend_* populated vs not, dp gather vs not). This factory funnels
+        the union into one place; callers pass only the values they have, and
+        defaults that depend on `capture_kind` (`dp_padding_mode`,
+        `global_forward_mode`, `num_token_non_padded_cpu`) are filled here.
+
+        TODO(attn-step-05): once `CudaGraphBufferRegistry` lands, the factory
+        will pull FB-shared buffer slices directly off a registry instead of
+        each caller doing its own slicing. The signature will collapse to
+        `(registry, capture_kind, bs, num_tokens, forward_mode, ...)` with
+        `extract_buffer(padded_bs=..., padded_num_tokens=..., template=...)`
+        producing the tensor-bearing fields. For now the factory stays
+        parameter-by-parameter so it can be exercised in isolation.
+
+        Must be called *outside* a `torch.cuda.graph(...)` capture scope
+        (the field assignments are pure Python; tensor fields are already
+        materialized by the caller, but `seq_lens_sum` and other host scalars
+        must be resolved by the caller before invocation).
+        """
+        # Per-kind default for global_forward_mode: capture paths mirror the
+        # primary forward_mode unless caller passes an explicit override.
+        if global_forward_mode is None:
+            global_forward_mode = forward_mode
+
+        # Per-kind default for dp_padding_mode. All four kinds historically
+        # use the cuda-graph default unless the caller has a specific one.
+        if dp_padding_mode is None:
+            dp_padding_mode = DpPaddingMode.get_default_mode_in_cuda_graph()
+
+        # Per-kind default for num_token_non_padded_cpu. The PCG / warmup /
+        # breakable sites store num_tokens directly; FULL_GRAPH / DUMMY_RUN
+        # leave it None because the graph buffer already carries the value.
+        if num_token_non_padded_cpu is None and capture_kind in (
+            CaptureKind.PIECEWISE_GRAPH,
+            CaptureKind.PIECEWISE_WARMUP_COMPILE,
+        ):
+            num_token_non_padded_cpu = num_tokens
+
+        return cls(
+            forward_mode=forward_mode,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=orig_seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens_sum,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            mamba_track_seqlens=mamba_track_seqlens,
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            input_embeds=input_embeds,
+            positions=positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=dp_padding_mode,
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=mrope_positions,
+            spec_algorithm=spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+            num_token_non_padded=num_token_non_padded,
+            num_token_non_padded_cpu=num_token_non_padded_cpu,
+            global_forward_mode=global_forward_mode,
+            lora_ids=lora_ids,
+            return_pooled_hidden_states=return_pooled_hidden_states,
+        )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""

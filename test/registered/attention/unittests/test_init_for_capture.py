@@ -1,0 +1,447 @@
+"""Parity tests for `ForwardBatch.init_for_capture`.
+
+The factory replaces five hand-coded `ForwardBatch(...)` constructors at the
+graph-capture entry points (`_dummy_run`, full-graph capture, PCG capture,
+PCG warmup_compile, breakable-graph capture). This test mirrors each of
+those original constructors verbatim against a `init_for_capture(...)` call
+and verifies field-by-field equality.
+
+Pure CPU test — no kernels involved; the factory only assigns dataclass
+fields. CUDA-only attribute (tensor `.device`) is exercised against the CPU
+device for determinism.
+
+Parity is the primary acceptance criterion for the 06.a landing PR per the
+L3 plan; once the call sites flip in 06.b / 06.c, this suite acts as a
+regression net against silent drift between the factory and any future
+ad-hoc construction at a capture entry point.
+"""
+
+import dataclasses
+import unittest
+
+import torch
+
+from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    CaptureKind,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=3, suite="base-test-cpu")
+
+
+def _assert_fb_equal(a: ForwardBatch, b: ForwardBatch) -> None:
+    """Field-by-field equality on two ForwardBatch instances.
+
+    Compares every dataclass field; tensors compared via `torch.equal` (must
+    share dtype + shape + values); other values via `==`.
+    """
+    fields = dataclasses.fields(ForwardBatch)
+    mismatches = []
+    for f in fields:
+        va = getattr(a, f.name)
+        vb = getattr(b, f.name)
+        if isinstance(va, torch.Tensor) or isinstance(vb, torch.Tensor):
+            if va is None or vb is None:
+                if va is not vb:
+                    mismatches.append((f.name, va, vb))
+                continue
+            if va.shape != vb.shape or va.dtype != vb.dtype or not torch.equal(va, vb):
+                mismatches.append((f.name, va, vb))
+        else:
+            if va != vb:
+                mismatches.append((f.name, va, vb))
+    assert not mismatches, "field mismatches:\n" + "\n".join(
+        f"  {name}: factory={fv!r} reference={rv!r}" for name, fv, rv in mismatches
+    )
+
+
+class TestInitForCaptureParity(CustomTestCase):
+    """Verify `init_for_capture(...)` matches each historical hand-coded ctor."""
+
+    DEVICE = torch.device("cpu")
+
+    def test_full_graph_minimal(self) -> None:
+        """Mirror `CudaGraphRunner.capture_one_batch_size` (decode, no spec, no DP, no LoRA, no mamba)."""
+        bs = 4
+        num_tokens = 4
+        input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+        req_pool_indices = torch.arange(bs, dtype=torch.int32)
+        seq_lens = torch.full((bs,), 32, dtype=torch.int32)
+        seq_lens_cpu = seq_lens.clone()
+        out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+        positions = torch.zeros(num_tokens, dtype=torch.int64)
+        mrope_positions = torch.zeros(3, num_tokens, dtype=torch.int64)
+        next_token_logits_buffer = torch.zeros(num_tokens, 256, dtype=torch.float32)
+        num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
+
+        reference = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+            encoder_lens=None,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=None,
+            mrope_positions=mrope_positions,
+            spec_algorithm=None,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=ForwardMode.DECODE,
+            lora_ids=None,
+        )
+
+        factory = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.FULL_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            positions=positions,
+            orig_seq_lens=seq_lens,
+            next_token_logits_buffer=next_token_logits_buffer,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+        )
+
+        _assert_fb_equal(factory, reference)
+
+    def test_piecewise_graph_extend(self) -> None:
+        """Mirror `PiecewiseCudaGraphRunner.capture_one_batch_size` (bs=1 extend)."""
+        bs = 1
+        num_tokens = 8
+        with torch.device(self.DEVICE):
+            input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+            input_embeds = None
+            req_pool_indices = torch.arange(bs)
+            seq_lens = torch.tensor([num_tokens])
+            orig_seq_lens = torch.tensor([num_tokens])
+            seq_lens_cpu = torch.tensor([num_tokens], device="cpu")
+            out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+            extend_seq_lens = torch.tensor([num_tokens])
+            extend_prefix_lens = torch.tensor([0])
+            extend_start_loc = torch.tensor([0])
+            extend_prefix_lens_cpu = torch.tensor([0], device="cpu")
+            extend_seq_lens_cpu = torch.tensor([num_tokens], device="cpu")
+            extend_logprob_start_lens_cpu = torch.tensor([num_tokens], device="cpu")
+            positions = torch.zeros(num_tokens, dtype=torch.int64)
+
+            reference = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=bs,
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                next_token_logits_buffer=None,
+                orig_seq_lens=orig_seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                mamba_track_indices=None,
+                mamba_track_mask=None,
+                mamba_track_seqlens=None,
+                encoder_lens=None,
+                return_logprob=False,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+                positions=positions,
+                global_num_tokens_gpu=None,
+                global_num_tokens_for_logprob_gpu=None,
+                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+                global_dp_buffer_len=None,
+                mrope_positions=None,
+                spec_algorithm=None,
+                spec_info=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
+                global_forward_mode=ForwardMode.EXTEND,
+                lora_ids=None,
+                return_pooled_hidden_states=False,
+            )
+
+            factory = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_GRAPH,
+                bs=bs,
+                num_tokens=num_tokens,
+                forward_mode=ForwardMode.EXTEND,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                positions=positions,
+                orig_seq_lens=orig_seq_lens,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+            )
+
+        _assert_fb_equal(factory, reference)
+
+    def test_piecewise_warmup_compile(self) -> None:
+        """Mirror `PiecewiseCudaGraphRunner.warmup_compile` — identical to PCG capture in field layout."""
+        bs = 1
+        num_tokens = 16
+        with torch.device(self.DEVICE):
+            input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+            req_pool_indices = torch.arange(1)
+            seq_lens = torch.tensor([num_tokens])
+            seq_lens_cpu = torch.tensor([num_tokens], device="cpu")
+            orig_seq_lens = torch.tensor([num_tokens])
+            out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+            positions = torch.zeros(num_tokens, dtype=torch.int64)
+            extend_seq_lens = torch.tensor([num_tokens])
+            extend_prefix_lens = torch.tensor([0])
+            extend_start_loc = torch.tensor([0])
+            extend_prefix_lens_cpu = torch.tensor([0], device="cpu")
+            extend_seq_lens_cpu = torch.tensor([num_tokens], device="cpu")
+            extend_logprob_start_lens_cpu = torch.tensor([num_tokens], device="cpu")
+
+            reference = ForwardBatch(
+                forward_mode=ForwardMode.EXTEND,
+                batch_size=1,
+                input_ids=input_ids,
+                input_embeds=None,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                next_token_logits_buffer=None,
+                orig_seq_lens=orig_seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                mamba_track_indices=None,
+                mamba_track_mask=None,
+                mamba_track_seqlens=None,
+                encoder_lens=None,
+                return_logprob=False,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+                positions=positions,
+                global_num_tokens_gpu=None,
+                global_num_tokens_for_logprob_gpu=None,
+                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+                global_dp_buffer_len=None,
+                mrope_positions=None,
+                spec_algorithm=None,
+                spec_info=None,
+                capture_hidden_mode=CaptureHiddenMode.NULL,
+                num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
+                global_forward_mode=ForwardMode.EXTEND,
+                lora_ids=None,
+                return_pooled_hidden_states=False,
+            )
+
+            factory = ForwardBatch.init_for_capture(
+                capture_kind=CaptureKind.PIECEWISE_WARMUP_COMPILE,
+                bs=bs,
+                num_tokens=num_tokens,
+                forward_mode=ForwardMode.EXTEND,
+                input_ids=input_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
+                seq_lens_sum=num_tokens,
+                positions=positions,
+                orig_seq_lens=orig_seq_lens,
+                extend_num_tokens=num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+            )
+
+        _assert_fb_equal(factory, reference)
+
+    def test_breakable_graph(self) -> None:
+        """Mirror `BreakableCudaGraphRunner._build_capture_forward_batch` (bs=1, fresh tensors)."""
+        bs = 1
+        num_tokens = 4
+        with torch.device(self.DEVICE):
+            seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
+            extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
+            extend_prefix_lens = torch.zeros((bs,), dtype=torch.int64)
+            extend_start_loc = torch.zeros((bs,), dtype=torch.int64)
+            req_pool_indices = torch.arange(bs, dtype=torch.int64)
+            orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
+            input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+            out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+            positions = torch.zeros(num_tokens, dtype=torch.int64)
+
+        reference = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=bs,
+            input_ids=input_ids,
+            input_embeds=None,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            next_token_logits_buffer=None,
+            orig_seq_lens=orig_seq_lens,
+            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=num_tokens,
+            mamba_track_indices=None,
+            mamba_track_mask=None,
+            mamba_track_seqlens=None,
+            encoder_lens=None,
+            return_logprob=False,
+            extend_num_tokens=num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
+            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            positions=positions,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=None,
+            mrope_positions=None,
+            spec_algorithm=None,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=None,
+            global_forward_mode=ForwardMode.EXTEND,
+            lora_ids=None,
+        )
+
+        factory = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.BREAKABLE_GRAPH,
+            bs=bs,
+            num_tokens=num_tokens,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=num_tokens,
+            positions=positions,
+            orig_seq_lens=orig_seq_lens,
+            extend_num_tokens=num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
+            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+
+        _assert_fb_equal(factory, reference)
+
+    def test_dummy_run_decode_minimal(self) -> None:
+        """Mirror `ModelRunner._dummy_run` (decode path: extend_* fields all None)."""
+        bs = 2
+        num_tokens = 2
+        input_ids = torch.zeros(num_tokens, dtype=torch.int32)
+        req_pool_indices = torch.arange(bs, dtype=torch.int32)
+        seq_lens = torch.full((bs,), 16, dtype=torch.int32)
+        seq_lens_cpu = seq_lens.clone()
+        out_cache_loc = torch.zeros(num_tokens, dtype=torch.int64)
+        positions = torch.zeros(num_tokens, dtype=torch.int64)
+        next_token_logits_buffer = torch.zeros(num_tokens, 128, dtype=torch.float32)
+        encoder_lens = None
+        mrope_positions = torch.zeros(3, num_tokens, dtype=torch.int64)
+        num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
+
+        reference = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            extend_num_tokens=None,
+            extend_seq_lens=None,
+            extend_prefix_lens=None,
+            extend_start_loc=None,
+            extend_prefix_lens_cpu=None,
+            extend_seq_lens_cpu=None,
+            global_num_tokens_gpu=None,
+            global_num_tokens_for_logprob_gpu=None,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=None,
+            mrope_positions=mrope_positions,
+            spec_algorithm=None,
+            spec_info=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=ForwardMode.DECODE,
+            lora_ids=None,
+        )
+
+        factory = ForwardBatch.init_for_capture(
+            capture_kind=CaptureKind.DUMMY_RUN,
+            bs=bs,
+            num_tokens=num_tokens,
+            forward_mode=ForwardMode.DECODE,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            positions=positions,
+            orig_seq_lens=seq_lens,
+            next_token_logits_buffer=next_token_logits_buffer,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+        )
+
+        _assert_fb_equal(factory, reference)
+
+
+if __name__ == "__main__":
+    unittest.main()
