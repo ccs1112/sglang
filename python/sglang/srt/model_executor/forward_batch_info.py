@@ -833,6 +833,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         global_forward_mode: Optional[ForwardMode] = None,
         dp_padding_mode: Optional[DpPaddingMode] = None,
         global_dp_buffer_len: Optional[int] = None,
+        global_num_tokens_cpu: Optional[List[int]] = None,
         global_num_tokens_gpu: Optional[torch.Tensor] = None,
         global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None,
         # Padding
@@ -920,6 +921,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dp_padding_mode=dp_padding_mode,

@@ -409,6 +409,7 @@ class TestInitForCaptureParity(CustomTestCase):
             extend_start_loc=None,
             extend_prefix_lens_cpu=None,
             extend_seq_lens_cpu=None,
+            global_num_tokens_cpu=[num_tokens],
             global_num_tokens_gpu=None,
             global_num_tokens_for_logprob_gpu=None,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -438,6 +439,7 @@ class TestInitForCaptureParity(CustomTestCase):
             next_token_logits_buffer=next_token_logits_buffer,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
+            global_num_tokens_cpu=[num_tokens],
         )
 
         _assert_fb_equal(factory, reference)
