@@ -68,18 +68,34 @@ Only the single-threaded PollProbe patches time.sleep; the concurrency path uses
 the TRUE sleep, so its wall numbers are unpatched. The latency tax is reported as
 a secondary, caveated number -- the CPU core-fraction is the result that matters.
 
+SCHED_GIL (--mode sched_gil) is a separate experiment on the same loops: how
+much does the poll loop's per-wake GIL re-acquisition slow a busy-spinning
+scheduler-style thread, ABOVE plain CPU-sharing? A victim thread shaped like
+the scheduler's event loop runs alone, alongside the real K=2 poll loops in
+this process (shared GIL), and alongside the identical workload in a child
+process (own GIL -- the CPU-sharing-only counterfactual). The difference of
+slowdowns is the GIL tax; attribution rides a sys.setswitchinterval sweep and
+a single-core pin, knobs only GIL handoff responds to. See run_sched_gil.
+
 Usage:
     python bench_nixl_poll.py --posix-async uring --mode both --direction both \
         --batch-sizes 1,4,16,64,128 --iters 200 --concurrency 1,2,4 \
         --output-file nixl_poll.jsonl
+    python bench_nixl_poll.py --mode sched_gil --posix-async uring \
+        --output-file sched_gil.jsonl
 """
 
 import argparse
+import gc
 import json
+import multiprocessing
 import os
 import platform
+import queue
+import random
 import shutil
 import statistics
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -396,6 +412,31 @@ class ConcurrencyResult:
     realized_sleep_us_idle: float
     realized_sleep_us_underload: float
     parallel_verdict: str
+
+
+@dataclass
+class SchedGilResult:
+    backend_mode: str
+    syscall_bound: bool
+    arm: str  # in_gil (threads, shared GIL) | off_gil (child process, own GIL)
+    switch_interval_s: float  # sys.setswitchinterval for the cell, both arms
+    victim_duty: str  # full (GIL held all pass) | yielding (100us sleep/pass)
+    victim_duty_realized: float  # measured alone-window cpu/wall (the true duty)
+    cores: str  # all | single (main thread + everything after pinned to one core)
+    rep: int
+    window_s: float
+    victim_rate_alone: float  # victim passes/s, mean of the two paired alone windows
+    victim_rate_with: float  # victim passes/s alongside the arm's workers
+    victim_slowdown: float  # 1 - with/alone
+    victim_cpu_frac_with: float  # victim thread CPU / wall in the with-window
+    victim_parked_ms: float  # wall - cpu: the defensible latency-side number
+    victim_stalls_per_s: float  # RAW wall-gap stalls (GIL + OS + work): diagnostic
+    victim_stalls_per_s_alone: float  # same, from the paired alone windows
+    victim_stall_p99_us: float  # p99 of with-window stalls; never GIL-added latency
+    worker_ops_per_s: float  # completed batch ops/s, summed over the K workers
+    worker_polls_per_s: float  # check_xfer_state calls/s, summed over the K workers
+    worker_cpu_s: float  # summed worker CPU in the window
+    alone_pair_spread: float  # |alone1-alone2|/mean -- this cell's noise sample
 
 
 def _pct(xs: List[float], q: float) -> float:
@@ -940,6 +981,767 @@ def run_concurrency(
     )
 
 
+# --------------------------------------------------------------------------- #
+# sched_gil: the scheduler-thread GIL tax of the poll loop (issue #26693).
+#
+# The maintainer-named gap: the IO threads re-acquire the GIL after each poll
+# sleep, which "might slow down other threads more than the pure CPU
+# utilization would suggest" -- SGLang's scheduler thread is a busy-spin
+# (event_loop_normal: a nonblocking zmq drain plus pure-Python batch work,
+# GIL-held) and is the thread taxed.
+#
+# A victim thread shaped like that loop runs in paired windows: alone, then
+# alongside each arm.
+#   ARM-A (in_gil):  the real K=2 poll-loop workload (batch_get_v1/batch_set_v1
+#                    -> the shipped _xfer_and_wait) as THREADS here, sharing
+#                    the victim's GIL.
+#   ARM-B (off_gil): the IDENTICAL workload in a spawned CHILD PROCESS with its
+#                    own NIXL agent, own files, own GIL -- same configured
+#                    cadence and work, zero shared-GIL traffic ("the polling
+#                    can happen while the scheduler makes progress").
+#
+#     EXCESS = victim_slowdown(in_gil) - victim_slowdown(off_gil)
+#
+# is the slowdown that is GIL coupling rather than CPU competition.
+# Attribution rides knobs only GIL handoff responds to: EXCESS must move with
+# sys.setswitchinterval (CPU-sharing, cache, and OS scheduling are invariant to
+# it) in the inverted-convoy direction -- the contender is GIL-light and the
+# victim GIL-heavy, so a LARGER interval lets the victim hold uninterrupted
+# longer and EXCESS peaks near ~200us then falls, the opposite of the textbook
+# convoy -- while the off_gil arm stays flat across the same sweep, and pinning
+# everything to one core removes the cross-core handoff battle and collapses
+# EXCESS.
+#
+# Honesty notes. (1) Arms are matched by CONFIGURED workload; realized cadence
+# and CPU diverge under load because the GIL throttles in_gil's wake rate (the
+# realized 100us sleep stretches toward the switch interval). That throttling
+# is part of the phenomenon, so per-arm realized ops/polls/CPU are reported,
+# never averaged away. (2) The poll-only contender omits the GIL the real IO
+# threads hold for hashing/tensor work, so EXCESS is a LOWER BOUND. (3) An
+# EXCESS below the paired-alone noise floor is reported as exactly that.
+# --------------------------------------------------------------------------- #
+
+_SGIL_INTERVALS_S = [50e-6, 200e-6, 1e-3, 5e-3, 25e-3, 100e-3]  # 5ms = default
+_SGIL_K = 2  # production topology: one prefetch-style READ + one backup WRITE
+_SGIL_RING = 32  # rotating key-batches per worker (warm after the first lap)
+# Victim work per pass. FULL mirrors the idle scheduler loop (near-100%
+# GIL-held pure Python); YIELDING adds one true 100us sleep per pass, a
+# GIL-released slice like a loaded scheduler's C/launch windows -- its realized
+# GIL-hold duty is LOW (~5-10%: the realized sleep dwarfs the ~5us of Python),
+# so the measured fraction is reported per row (victim_duty_realized) rather
+# than trusted from the label.
+_SGIL_WORK_FULL = 8
+_SGIL_WORK_YIELDING = 128
+# A victim work pass stretched past this is recorded as a stall. Stalls are
+# RAW wall gaps (GIL waits + OS deschedules + the work itself) -- a diagnostic
+# series, never quotable as GIL-added latency; the window-level wall-minus-CPU
+# (victim_parked_ms) is the defensible latency-side number. The yielding
+# threshold is higher because its pass does ~16x the Python work.
+_SGIL_STALL_NS_FULL = 10_000
+_SGIL_STALL_NS_YIELDING = 50_000
+_SGIL_COLLAPSE_ABS = 0.01  # 1pp absolute bar for the single-core collapse
+
+
+def _sgil_victim(stop: threading.Event, out: dict, duty: str) -> None:
+    """Scheduler stand-in: a nonblocking drain that raises on empty (the
+    request_receiver._pull_raw_reqs shape) plus small-object bookkeeping, GIL
+    held across the pass. duty='yielding' adds one true 100us sleep per pass;
+    'full' never releases. Passes-per-window is the metric: a count survives a
+    coarse CPU clock. Stall accounting restarts its clock AFTER the intended
+    sleep returns, so the wake stretch beyond the requested sleep is outside
+    stalls_ns by design (it shows up in passes/s and parked time instead)."""
+    backlog: list = []
+    table: dict = {}
+    yielding = duty == "yielding"
+    work_reps = _SGIL_WORK_YIELDING if yielding else _SGIL_WORK_FULL
+    stall_ns = _SGIL_STALL_NS_YIELDING if yielding else _SGIL_STALL_NS_FULL
+    passes = 0
+    n = 0
+    stalls_ns: List[int] = []
+    c0 = _thread_cpu()
+    t0 = time.perf_counter()
+    prev = time.perf_counter_ns()
+    while not stop.is_set():
+        if yielding:
+            time.sleep(REQUESTED_SLEEP_S)
+            prev = time.perf_counter_ns()  # the sleep is intended, not a stall
+        try:
+            backlog.pop()
+        except IndexError:
+            pass
+        for _ in range(work_reps):
+            table[n & 63] = n
+            n += 1
+        passes += 1
+        now = time.perf_counter_ns()
+        if now - prev > stall_ns:
+            stalls_ns.append(now - prev)
+        prev = now
+    out["passes"] = passes
+    out["wall_s"] = time.perf_counter() - t0
+    out["cpu_s"] = _thread_cpu() - c0
+    out["stalls_ns"] = stalls_ns
+
+
+def _sgil_victim_window(duty: str, window_s: float) -> dict:
+    stop = threading.Event()
+    out: dict = {}
+    vt = threading.Thread(target=_sgil_victim, args=(stop, out, duty), daemon=True)
+    gc.collect()
+    gc.disable()  # a gen0 pass inside a sub-second window is victim-rate noise
+    try:
+        vt.start()
+        time.sleep(window_s)  # a true sleep: the main thread stays off the GIL
+        stop.set()
+        vt.join(5.0)
+    finally:
+        gc.enable()
+    if vt.is_alive():  # the loop has no blocking calls; fail loud regardless
+        raise RuntimeError("sched_gil victim thread failed to stop")
+    return out
+
+
+def _sgil_ring(tid: int) -> List[List[str]]:
+    return [[f"sgil_{tid}_{i}"] for i in range(_SGIL_RING)]
+
+
+def _sgil_indices(tid: int, page_size: int) -> torch.Tensor:
+    # Disjoint single-page host rows per worker (run_concurrency's isolation).
+    return torch.arange(tid * page_size, (tid + 1) * page_size, dtype=torch.int64)
+
+
+def _sgil_seed(hicache, page_size: int) -> None:
+    # Create every ring entry outside any timed window, so both arms run a
+    # warm-overwrite/warm-read steady state from their first lap.
+    for tid in range(_SGIL_K):
+        idx = _sgil_indices(tid, page_size)
+        for keys in _sgil_ring(tid):
+            hicache.batch_set_v1(keys, idx)
+
+
+def _install_poll_counter(agent) -> Tuple[Any, Any]:
+    # The sanctioned seam (run_concurrency uses the same shape): wrap one
+    # settable method on a benchmark-constructed agent; never module globals.
+    tls = threading.local()
+    orig = agent.check_xfer_state
+
+    def counting(handle):
+        tls.polls = getattr(tls, "polls", 0) + 1
+        return orig(handle)
+
+    agent.check_xfer_state = counting
+
+    def restore():
+        agent.check_xfer_state = orig
+
+    return tls, restore
+
+
+def _sgil_role_loop(
+    hicache,
+    tid: int,
+    page_size: int,
+    begin: threading.Event,
+    stop: threading.Event,
+    stats: dict,
+    tls,
+) -> None:
+    """One poll-loop worker: real batch ops -> the shipped _xfer_and_wait, over
+    a ring of warm keys, until stopped. The SAME function drives ARM-A (threads
+    in this process) and ARM-B (threads inside the child process), which is
+    what makes the arms' configured workloads identical. Ops before `begin`
+    (the settle ramp) are uncounted, so the recorded cadence/CPU cover only
+    the victim's measured window -- the ramp runs unthrottled and would
+    otherwise inflate the reported contended cadence."""
+    try:
+        idx = _sgil_indices(tid, page_size)
+        ring = _sgil_ring(tid)
+        role = "READ" if tid % 2 == 0 else "WRITE"
+        ops = 0
+        while not begin.is_set() and not stop.is_set():
+            keys = ring[ops % _SGIL_RING]
+            if role == "WRITE":
+                hicache.batch_set_v1(keys, idx)
+            else:
+                hicache.batch_get_v1(keys, idx)
+            ops += 1
+        tls.polls = 0
+        ops = 0
+        c0 = _thread_cpu()
+        t0 = time.perf_counter()
+        while not stop.is_set():
+            keys = ring[ops % _SGIL_RING]
+            if role == "WRITE":
+                hicache.batch_set_v1(keys, idx)
+            else:
+                hicache.batch_get_v1(keys, idx)
+            ops += 1
+        # Distinct-key dict stores are atomic under the GIL; lock omitted.
+        stats[tid] = {
+            "ops": ops,
+            "wall_s": time.perf_counter() - t0,
+            "cpu_s": _thread_cpu() - c0,
+            "polls": getattr(tls, "polls", 0),
+        }
+    except Exception as e:  # a dead worker must fail the cell, not shrink it
+        stats[tid] = {"error": repr(e)}
+
+
+def _sgil_worker_totals(stats: dict, threads: List[threading.Thread]) -> dict:
+    """Validate-and-aggregate. A worker that died, never reported, or outlived
+    its join would silently shrink the contender and manufacture (or erase)
+    EXCESS; refuse to produce totals instead."""
+    alive = [t.name for t in threads if t.is_alive()]
+    if alive:
+        raise RuntimeError(f"sched_gil workers failed to stop: {alive}")
+    errors = {tid: s["error"] for tid, s in stats.items() if "error" in s}
+    if errors:
+        raise RuntimeError(f"sched_gil worker errors: {errors}")
+    if len(stats) != _SGIL_K or any(s["ops"] <= 0 for s in stats.values()):
+        raise RuntimeError(f"sched_gil worker stats incomplete: {stats}")
+    wall = max(s["wall_s"] for s in stats.values())
+    return {
+        "ops_per_s": sum(s["ops"] for s in stats.values()) / wall if wall else 0.0,
+        "polls_per_s": (
+            sum(s["polls"] for s in stats.values()) / wall if wall else 0.0
+        ),
+        "cpu_s": sum(s["cpu_s"] for s in stats.values()),
+    }
+
+
+def _sgil_child_main(cfg: dict, cmd_q, res_q) -> None:
+    """ARM-B body: the identical K=2 workload against this child's OWN agent
+    and OWN GIL. Protocol: emit 'ready'; then per window: ('run', si) ->
+    settle -> ack 'running' -> workers spin until 'stop' -> totals dict (or
+    {'error': ...}). Any unexpected message tears down."""
+    hicache = None
+    try:
+        if cfg["cores"] is not None and hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, set(cfg["cores"]))
+        host = BenchMemPoolHost(
+            zero_copy=True,
+            page_size=cfg["page_size"],
+            layer_num=cfg["layer_num"],
+            head_num=cfg["head_num"],
+            head_dim=cfg["head_dim"],
+            num_pages=_SGIL_K + 8,
+            dtype=getattr(torch, cfg["dtype_name"]),
+        )
+        os.makedirs(cfg["file_path"], exist_ok=True)
+        hicache = _make_hicache(cfg["file_path"], cfg["backend_mode"])
+        hicache.register_mem_pool_host(host)
+        _sgil_seed(hicache, cfg["page_size"])
+        tls, restore = _install_poll_counter(hicache.agent)
+        res_q.put("ready")
+        while True:
+            msg = cmd_q.get()
+            if not (isinstance(msg, tuple) and msg[0] == "run"):
+                break  # 'exit' (or a protocol breakdown): tear down
+            # Match the parent's swept interval so the contender's INTERNAL
+            # worker-worker GIL handoff is configured identically across the
+            # arms; otherwise the "off_gil is flat across the sweep" leg would
+            # be true by construction instead of being a real placebo test.
+            sys.setswitchinterval(msg[1])
+            begin = threading.Event()
+            stop = threading.Event()
+            stats: dict = {}
+            threads = [
+                threading.Thread(
+                    target=_sgil_role_loop,
+                    args=(hicache, tid, cfg["page_size"], begin, stop, stats, tls),
+                    daemon=True,
+                )
+                for tid in range(_SGIL_K)
+            ]
+            gc.collect()
+            gc.disable()  # mirror the parent's GC-free measured window
+            try:
+                for t in threads:
+                    t.start()
+                time.sleep(0.05)  # the same settle ARM-A's loops get
+                begin.set()
+                res_q.put("running")
+                second = cmd_q.get()  # 'stop' (or 'exit' if the parent died)
+                stop.set()
+                for t in threads:
+                    t.join(5.0)
+            finally:
+                gc.enable()
+            try:
+                res_q.put(_sgil_worker_totals(stats, threads))
+            except RuntimeError as e:
+                res_q.put({"error": repr(e)})
+                break
+            if second != "stop":
+                break
+        restore()
+    except Exception as e:  # surface the failure to the parent, don't hang it
+        res_q.put({"error": repr(e)})
+    finally:
+        if hicache is not None:
+            try:
+                hicache.clear()
+                hicache.close()
+            except Exception:
+                pass
+
+
+class _SgilChild:
+    """Parent-side handle for the off_gil child process."""
+
+    def __init__(self, cfg: dict):
+        ctx = multiprocessing.get_context("spawn")  # never fork a NIXL parent
+        self.cmd_q = ctx.Queue()
+        self.res_q = ctx.Queue()
+        self._closed = False
+        self.proc = ctx.Process(
+            target=_sgil_child_main, args=(cfg, self.cmd_q, self.res_q), daemon=True
+        )
+        self.proc.start()
+        ready = self._get(180.0)  # spawn re-import + agent build + seeding
+        if ready != "ready":
+            raise SystemExit(f"off_gil child failed to start: {ready}")
+
+    def _get(self, timeout_s: float):
+        # Short-poll so a child that died without replying (e.g. a native
+        # crash inside NIXL) reports its exit code instead of a bare timeout.
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                return self.res_q.get(timeout=1.0)
+            except queue.Empty:
+                if not self.proc.is_alive():
+                    raise SystemExit(
+                        f"off_gil child died (exitcode={self.proc.exitcode})"
+                    )
+                if time.monotonic() > deadline:
+                    raise SystemExit(
+                        f"off_gil child unresponsive for {timeout_s:.0f}s"
+                    )
+
+    def window(self, si: float, run_victim) -> Tuple[dict, dict]:
+        self.cmd_q.put(("run", si))
+        ack = self._get(60.0)
+        if ack != "running":
+            raise SystemExit(f"off_gil child failed mid-run: {ack}")
+        try:
+            v = run_victim()
+        finally:
+            self.cmd_q.put("stop")  # always release the child's window wait
+        totals = self._get(30.0)
+        if not isinstance(totals, dict) or "error" in totals:
+            raise SystemExit(f"off_gil child worker failure: {totals}")
+        return v, totals
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.cmd_q.put("exit")
+            self.proc.join(10.0)
+        finally:
+            if self.proc.is_alive():
+                self.proc.terminate()
+
+
+def run_sched_gil(
+    args, dtype, backend_mode: str, syscall_bound: bool
+) -> Tuple[List[SchedGilResult], dict]:
+    window_s = args.sched_gil_window
+    half_reps = max(1, args.sched_gil_reps // 2)  # reps split across two passes
+    page_size = args.page_size
+    default_si = sys.getswitchinterval()
+
+    # ARM-A's backend lives in this process; ARM-B's child gets its own dir +
+    # agent, so the arms never share backend state.
+    a_dir = os.path.join(args.file_path, "sgil_a")
+    b_dir = os.path.join(args.file_path, "sgil_b")
+    os.makedirs(a_dir, exist_ok=True)
+    host = BenchMemPoolHost(
+        zero_copy=True,
+        page_size=page_size,
+        layer_num=args.layer_num,
+        head_num=args.head_num,
+        head_dim=args.head_dim,
+        num_pages=_SGIL_K + 8,
+        dtype=dtype,
+    )
+    hicache = _make_hicache(a_dir, backend_mode)
+    hicache.register_mem_pool_host(host)
+    _sgil_seed(hicache, page_size)
+    tls_a, restore_a = _install_poll_counter(hicache.agent)
+
+    child_cfg = {
+        "file_path": b_dir,
+        "backend_mode": backend_mode,
+        "cores": None,
+        "page_size": page_size,
+        "layer_num": args.layer_num,
+        "head_num": args.head_num,
+        "head_dim": args.head_dim,
+        "dtype_name": args.dtype,
+    }
+    rows: List[SchedGilResult] = []
+    meta = {"k": _SGIL_K, "preregistered_floor": 0.0}
+
+    def rate(v: dict) -> float:
+        return v["passes"] / v["wall_s"] if v["wall_s"] else 0.0
+
+    def with_arm_a(duty: str, si: float) -> Tuple[dict, dict]:
+        # si is already live process-wide here; the parameter exists so both
+        # arms share one call shape.
+        begin = threading.Event()
+        stop = threading.Event()
+        stats: dict = {}
+        threads = [
+            threading.Thread(
+                target=_sgil_role_loop,
+                args=(hicache, tid, page_size, begin, stop, stats, tls_a),
+                daemon=True,
+            )
+            for tid in range(_SGIL_K)
+        ]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)  # let the poll loops reach steady state first
+        begin.set()  # cadence/CPU counting starts with the victim window
+        v = _sgil_victim_window(duty, window_s)
+        stop.set()
+        for t in threads:
+            t.join(5.0)
+        return v, _sgil_worker_totals(stats, threads)
+
+    child_box = {"child": _SgilChild(child_cfg)}
+
+    def with_arm_b(duty: str, si: float) -> Tuple[dict, dict]:
+        return child_box["child"].window(
+            si, lambda: _sgil_victim_window(duty, window_s)
+        )
+
+    def cell(arm, duty, si, cores_label, rep, with_fn) -> SchedGilResult:
+        a1 = _sgil_victim_window(duty, window_s)
+        vw, workers = with_fn(duty, si)
+        a2 = _sgil_victim_window(duty, window_s)
+        r1, r2 = rate(a1), rate(a2)
+        alone = (r1 + r2) / 2.0
+        rw = rate(vw)
+        stalls = vw["stalls_ns"]
+        alone_wall = a1["wall_s"] + a2["wall_s"]
+        return SchedGilResult(
+            backend_mode=backend_mode,
+            syscall_bound=syscall_bound,
+            arm=arm,
+            switch_interval_s=si,
+            victim_duty=duty,
+            victim_duty_realized=(
+                (a1["cpu_s"] + a2["cpu_s"]) / alone_wall if alone_wall else 0.0
+            ),
+            cores=cores_label,
+            rep=rep,
+            window_s=window_s,
+            victim_rate_alone=alone,
+            victim_rate_with=rw,
+            victim_slowdown=1.0 - rw / alone if alone else 0.0,
+            victim_cpu_frac_with=(
+                vw["cpu_s"] / vw["wall_s"] if vw["wall_s"] else 0.0
+            ),
+            victim_parked_ms=(vw["wall_s"] - vw["cpu_s"]) * 1000.0,
+            victim_stalls_per_s=(
+                len(stalls) / vw["wall_s"] if vw["wall_s"] else 0.0
+            ),
+            victim_stalls_per_s_alone=(
+                (len(a1["stalls_ns"]) + len(a2["stalls_ns"])) / alone_wall
+                if alone_wall
+                else 0.0
+            ),
+            victim_stall_p99_us=(
+                _pct([s / 1000.0 for s in stalls], 0.99) if stalls else 0.0
+            ),
+            worker_ops_per_s=workers["ops_per_s"],
+            worker_polls_per_s=workers["polls_per_s"],
+            worker_cpu_s=workers["cpu_s"],
+            alone_pair_spread=abs(r1 - r2) / alone if alone else 0.0,
+        )
+
+    try:
+        # Pre-registered noise floor: alone-vs-alone pairs at the default
+        # interval, before any contended cell. The verdict's load-bearing
+        # floor per cell is the max of this and the in-sweep paired-alone
+        # spreads (with-window noise enters via the per-rep paired-EXCESS CI).
+        floor_pairs = []
+        for _ in range(3):
+            f1 = rate(_sgil_victim_window("full", window_s))
+            f2 = rate(_sgil_victim_window("full", window_s))
+            floor_pairs.append(abs(f1 - f2) / ((f1 + f2) / 2.0))
+        meta["preregistered_floor"] = statistics.median(floor_pairs)
+        print(
+            f"sched_gil noise floor (alone-vs-alone, {len(floor_pairs)} pairs): "
+            f"median {meta['preregistered_floor'] * 100:.2f}% "
+            f"max {max(floor_pairs) * 100:.2f}%"
+        )
+
+        # Main sweep, all cores: two passes (ascending then descending interval
+        # order) so time-correlated drift cannot masquerade as a slope.
+        for p, order in enumerate(
+            (_SGIL_INTERVALS_S, list(reversed(_SGIL_INTERVALS_S)))
+        ):
+            for si in order:
+                sys.setswitchinterval(si)
+                for duty in ("full", "yielding"):
+                    for k in range(half_reps):
+                        rep = p * half_reps + k
+                        rows.append(
+                            cell("in_gil", duty, si, "all", rep, with_arm_a)
+                        )
+                        rows.append(
+                            cell("off_gil", duty, si, "all", rep, with_arm_b)
+                        )
+                print(f"sched_gil pass {p} si={si:g} done", flush=True)
+
+        # Single-core collapse at the default interval: the cross-core handoff
+        # battle disappears, so a GIL-channel EXCESS must collapse. Pinning
+        # covers the main thread and everything spawned after it (victim,
+        # in_gil workers); the child pins itself at startup, before its agent
+        # exists. Pre-existing NIXL-internal threads in this process are NOT
+        # re-pinned -- stated, not hidden. A failure here (restricted cpuset,
+        # spawn trouble) must not destroy the completed sweep: skip instead.
+        sys.setswitchinterval(default_si)
+        if hasattr(os, "sched_setaffinity"):
+            try:
+                core = min(os.sched_getaffinity(0))
+                child_box["child"].close()
+                pinned_cfg = dict(child_cfg)
+                pinned_cfg["cores"] = [core]
+                # Spawn (and let it import torch) BEFORE pinning ourselves.
+                child_box["child"] = _SgilChild(pinned_cfg)
+                prev_aff = os.sched_getaffinity(0)
+                os.sched_setaffinity(0, {core})
+                try:
+                    for duty in ("full", "yielding"):
+                        for k in range(2 * half_reps):
+                            rows.append(
+                                cell(
+                                    "in_gil",
+                                    duty,
+                                    default_si,
+                                    "single",
+                                    k,
+                                    with_arm_a,
+                                )
+                            )
+                            rows.append(
+                                cell(
+                                    "off_gil",
+                                    duty,
+                                    default_si,
+                                    "single",
+                                    k,
+                                    with_arm_b,
+                                )
+                            )
+                finally:
+                    os.sched_setaffinity(0, prev_aff)
+            except (OSError, RuntimeError, SystemExit) as e:
+                print(f"sched_gil: skipping single-core cells ({e})")
+        else:
+            print("sched_gil: no sched_setaffinity; skipping single-core cells")
+    finally:
+        sys.setswitchinterval(default_si)
+        restore_a()
+        child_box["child"].close()
+        try:
+            hicache.clear()
+            hicache.close()
+        except Exception:
+            pass
+    return rows, meta
+
+
+def _sgil_bootstrap_ci(
+    vals: List[float], n: int = 2000, lo: float = 0.025, hi: float = 0.975
+) -> Tuple[float, float]:
+    # Percentile bootstrap over the per-rep PAIRED excess values. Few reps make
+    # it crude, but it is the bound uncertainty statement; seeded so reruns of
+    # the same JSONL reproduce the same CI.
+    rng = random.Random(26693)
+    means = sorted(
+        statistics.fmean(rng.choice(vals) for _ in vals) for _ in range(n)
+    )
+    return means[int(lo * (n - 1))], means[int(hi * (n - 1))]
+
+
+def _sgil_excess_table(
+    rows: List[SchedGilResult], preregistered_floor: float
+) -> List[dict]:
+    cells: Dict[Tuple, dict] = {}
+    for r in rows:
+        key = (r.cores, r.victim_duty, r.switch_interval_s)
+        d = cells.setdefault(key, {"in_gil": {}, "off_gil": {}, "spread": []})
+        d[r.arm][r.rep] = r.victim_slowdown
+        d["spread"].append(r.alone_pair_spread)
+    out = []
+    for (cores, duty, si), d in sorted(cells.items()):
+        a, b = d["in_gil"], d["off_gil"]
+        med_a = statistics.median(a.values()) if a else 0.0
+        med_b = statistics.median(b.values()) if b else 0.0
+        # Pair by rep (the interleaving ran rep k's arms back to back), so the
+        # CI sees with-window noise, which alone-pair spreads cannot.
+        paired = [a[k] - b[k] for k in sorted(set(a) & set(b))]
+        if len(paired) >= 2:
+            ci_lo, ci_hi = _sgil_bootstrap_ci(paired)
+        else:
+            ci_lo = ci_hi = paired[0] if paired else 0.0
+        out.append(
+            {
+                "cores": cores,
+                "duty": duty,
+                "switch_interval_s": si,
+                "slowdown_in_gil": med_a,
+                "slowdown_off_gil": med_b,
+                "excess": statistics.median(paired) if paired else med_a - med_b,
+                "excess_ci_lo": ci_lo,
+                "excess_ci_hi": ci_hi,
+                "floor": max(
+                    preregistered_floor,
+                    statistics.median(d["spread"]) if d["spread"] else 0.0,
+                ),
+            }
+        )
+    return out
+
+
+def _sched_gil_verdict(
+    table: List[dict], rows: List[SchedGilResult]
+) -> List[str]:
+    lines = ["", "sched_gil verdict:"]
+    sweep = [c for c in table if c["cores"] == "all" and c["duty"] == "full"]
+    sweep.sort(key=lambda c: c["switch_interval_s"])
+    if not sweep:
+        return lines + ["  no all-core full-duty cells; nothing to judge"]
+    floor = statistics.median(c["floor"] for c in sweep)
+    default = min(sweep, key=lambda c: abs(c["switch_interval_s"] - 0.005))
+    lines.append(
+        f"  EXCESS at the default interval "
+        f"({default['switch_interval_s'] * 1e3:.0f}ms, full duty): "
+        f"{default['excess'] * 100:.2f}pp "
+        f"[95% CI {default['excess_ci_lo'] * 100:.2f}.."
+        f"{default['excess_ci_hi'] * 100:.2f}] vs floor {floor * 100:.2f}pp "
+        f"(off-GIL arm = a child process, a simulated control; no real "
+        f"off-GIL poll path exists upstream) -> "
+        + (
+            "magnitude quotable (a LOWER BOUND: poll-only contender)"
+            if default["excess_ci_lo"] > floor
+            else "below/near floor -> mechanism-only headline; an honest small number"
+        )
+    )
+    ex = [c["excess"] for c in sweep]
+    lines.append(
+        "  switch-interval sweep (the GIL-only knob): "
+        + "  ".join(
+            f"{e * 100:.2f}%@{c['switch_interval_s'] * 1e6:.0f}us"
+            for e, c in zip(ex, sweep)
+        )
+    )
+    peak = max(range(len(ex)), key=lambda i: ex[i])
+    moves = (max(ex) - min(ex)) > 2 * floor
+    falls = ex[-1] < max(ex) - 2 * floor
+    if moves and peak == len(ex) - 1:
+        lines.append(
+            "  GIL signature: DIRECTION REVERSED (rises to the largest "
+            "interval -- the canonical convoy). The pre-registered "
+            "inverted-convoy frame is refuted; do not quote the sweep as a "
+            "GIL signature."
+        )
+    else:
+        lines.append(
+            "  GIL signature (peaks then falls -- the inverted convoy): "
+            + (
+                "PRESENT"
+                if (moves and falls and peak < len(ex) - 1)
+                else "NOT RESOLVED"
+            )
+        )
+    offg = [c["slowdown_off_gil"] for c in sweep]
+    lines.append(
+        "  off_gil arm flat across the sweep (CPU-sharing cannot hear the "
+        "knob; the child runs the same swept interval): "
+        + (
+            "YES"
+            if (max(offg) - min(offg)) <= 2 * floor
+            else f"NO (moves {(max(offg) - min(offg)) * 100:.2f}pp -- investigate)"
+        )
+    )
+    for s in (c for c in table if c["cores"] == "single"):
+        lines.append(
+            f"  single-core EXCESS ({s['duty']} duty): "
+            f"{s['excess'] * 100:.2f}pp -> "
+            + (
+                "collapsed (the channel was the cross-core handoff battle)"
+                if s["excess"] <= max(2 * floor, _SGIL_COLLAPSE_ABS)
+                else "did NOT collapse -- investigate before quoting anything"
+            )
+        )
+    # Agent-aging drift check (the backend-state lesson from the concurrency
+    # hardening): the in_gil contender's measured cadence should match across
+    # the two sweep passes; large drift taints the magnitudes.
+    ig = [
+        r
+        for r in rows
+        if r.arm == "in_gil" and r.cores == "all" and r.victim_duty == "full"
+    ]
+    if ig:
+        nreps = max(r.rep for r in ig) + 1
+        p0 = [r.worker_ops_per_s for r in ig if r.rep < (nreps + 1) // 2]
+        p1 = [r.worker_ops_per_s for r in ig if r.rep >= (nreps + 1) // 2]
+        if p0 and p1:
+            m0, m1 = statistics.median(p0), statistics.median(p1)
+            drift = abs(m1 - m0) / m0 if m0 else 0.0
+            lines.append(
+                f"  in_gil contender drift across passes (agent-aging check): "
+                f"{drift * 100:.1f}% "
+                + (
+                    "(ok)"
+                    if drift <= 0.2
+                    else "(LARGE -- treat magnitudes with suspicion)"
+                )
+            )
+    lines.append(
+        "  caveats: the contender is poll-only (the real IO threads also hold "
+        "the GIL for hashing/tensor work -> every EXCESS here is a lower "
+        "bound); arms are matched by CONFIGURED workload while realized "
+        "cadence/CPU diverge under load (the GIL throttling of in_gil is part "
+        "of the measured phenomenon); stall fields are raw wall gaps "
+        "(GIL + OS deschedule + work), diagnostics only."
+    )
+    return lines
+
+
+def _print_sched_gil(
+    rows: List[SchedGilResult], preregistered_floor: float
+) -> List[dict]:
+    table = _sgil_excess_table(rows, preregistered_floor)
+    print(
+        "\n=== sched_gil: scheduler-thread GIL tax "
+        "(EXCESS = in_gil - off_gil slowdown) ==="
+    )
+    print(
+        f"{'cores':>6} {'duty':>8} {'switch_int_s':>12} {'in_gil':>8} "
+        f"{'off_gil':>8} {'EXCESS':>8} {'ci_lo':>7} {'ci_hi':>7} {'floor':>7}"
+    )
+    for c in table:
+        print(
+            f"{c['cores']:>6} {c['duty']:>8} {c['switch_interval_s']:>12.6f} "
+            f"{c['slowdown_in_gil'] * 100:>7.2f}% "
+            f"{c['slowdown_off_gil'] * 100:>7.2f}% "
+            f"{c['excess'] * 100:>7.2f}% {c['excess_ci_lo'] * 100:>6.2f}% "
+            f"{c['excess_ci_hi'] * 100:>6.2f}% {c['floor'] * 100:>6.2f}%"
+        )
+    for line in _sched_gil_verdict(table, rows):
+        print(line)
+    return table
+
+
 def _print_headline(results: List[CellResult]) -> None:
     """What a reviewer reads first: the granularity-robust CPU core-fraction. The
     headline is the NO_SLEEP core_fraction (a true busy-poll); the 'real'
@@ -1106,7 +1908,15 @@ def main():
             "if uring fails. sync 'none' => zero polls, degenerate."
         ),
     )
-    p.add_argument("--mode", default="both", choices=["zero_copy", "bounce", "both"])
+    p.add_argument(
+        "--mode",
+        default="both",
+        choices=["zero_copy", "bounce", "both", "sched_gil"],
+        help=(
+            "Host-pool layout to benchmark, or 'sched_gil' to run the separate "
+            "scheduler-thread GIL-tax experiment instead (see run_sched_gil)."
+        ),
+    )
     p.add_argument("--direction", default="both", choices=["WRITE", "READ", "both"])
     p.add_argument("--variants", default="real,no_sleep")
     p.add_argument("--batch-sizes", default="1,4,16,64,128")
@@ -1123,6 +1933,18 @@ def main():
         type=int,
         default=200,
         help="Iterations per thread in the concurrency harness.",
+    )
+    p.add_argument(
+        "--sched-gil-window",
+        type=float,
+        default=0.8,
+        help="sched_gil mode: seconds per measured victim window.",
+    )
+    p.add_argument(
+        "--sched-gil-reps",
+        type=int,
+        default=4,
+        help="sched_gil mode: paired reps per cell, split across the two passes.",
     )
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--warmup", type=int, default=10)
@@ -1201,6 +2023,40 @@ def main():
         f"realized_sleep_us={realized_sleep_us_idle:.1f} (requested "
         f"{REQUESTED_SLEEP_S * 1e6:.0f}us) -> real kernel verified"
     )
+
+    # sched_gil is its own experiment, not a host-pool layout: branch out before
+    # the layout loop (which would otherwise misread it as a bounce layout).
+    if args.mode == "sched_gil":
+        srows, smeta = run_sched_gil(args, dtype, backend_mode, syscall_bound)
+        table = _print_sched_gil(srows, smeta["preregistered_floor"])
+        if args.output_file:
+            with open(args.output_file, "a") as f:
+                # One host row so the JSONL is self-certifying offline.
+                f.write(
+                    json.dumps(
+                        {
+                            "kind": "sched_gil_host",
+                            "uname": f"{un.system} {un.release} {un.machine}",
+                            "thread_cpu_clock_res_ns": clock_res_ns,
+                            "realized_sleep_us_idle": realized_sleep_us_idle,
+                            "K": smeta["k"],
+                            "preregistered_floor": smeta["preregistered_floor"],
+                            "backend_mode": backend_mode,
+                            "syscall_bound": syscall_bound,
+                        }
+                    )
+                    + "\n"
+                )
+                for s in srows:
+                    f.write(json.dumps({"kind": "sched_gil", **asdict(s)}) + "\n")
+                for c in table:
+                    f.write(json.dumps({"kind": "sched_gil_summary", **c}) + "\n")
+            print(
+                f"\nWrote {len(srows)} sched_gil rows + {len(table)} summary "
+                f"rows to {args.output_file}"
+            )
+        _clear_files(args.file_path)
+        return
 
     results: List[CellResult] = []
     cresults: List[ConcurrencyResult] = []
